@@ -93,9 +93,11 @@ def source_ht(wanted):
         log("ht: channel list failed")
         return {}
     by_station = {}
+    lw = {w.lower(): w for w in wanted}
     for c in chans.get("channels", []):
-        if c.get("title") in wanted:
-            by_station.setdefault(str(c.get("station_id")), c["title"])
+        w = lw.get((c.get("title") or "").lower())
+        if w:
+            by_station.setdefault(str(c.get("station_id")), w)
     log(f"ht: {len(chans.get('channels', []))} channels, matched {len(set(by_station.values()))}/{len(wanted)}")
     missing = sorted(set(wanted) - set(by_station.values()))
     if missing:
@@ -119,7 +121,53 @@ def source_ht(wanted):
         log(f"ht {date}: {len(out)} channels so far")
     return out
 
-SOURCES = {"mts": source_mts, "ht": source_ht}
+
+# ---------- United Cloud (SBB / EON / Telemach) ----------
+UC = "https://api-web.ug-be.cdn.united.cloud"
+UC_BASIC = "MjdlMTFmNWUtODhlMi00OGU0LWJkNDItOGUxNWFiYmM2NmY1OjEyejJzMXJ3bXdhZmsxMGNkdzl0cjloOWFjYjZwdjJoZDhscXZ0aGc="
+UC_COMMUNITY, UC_LANG = 30, 59
+
+def source_united(wanted):
+    try:
+        r = urllib.request.Request(f"{UC}/oauth/token?grant_type=client_credentials", data=b"", method="POST",
+                                   headers={"User-Agent": UA, "Authorization": f"Basic {UC_BASIC}"})
+        with urllib.request.urlopen(r, timeout=60) as f:
+            tok = json.load(f)["access_token"]
+    except Exception as e:
+        log(f"united: token failed: {e}")
+        return {}
+    H = {"Authorization": f"Bearer {tok}", "Referer": "https://epg.telemach.ba/"}
+    chans = get_json(f"{UC}/v1/public/channels?channelType=TV&communityId={UC_COMMUNITY}&languageId={UC_LANG}&imageSize=L", H) or []
+    resolve = {}  # wanted key -> cid
+    for w in wanted:
+        if w.isdigit():
+            resolve[w] = w
+            continue
+        for c in chans:
+            if (c.get("name") or "").upper().startswith(w.upper()):
+                resolve[w] = str(c["id"])
+                break
+    missing = sorted(set(wanted) - set(resolve))
+    log(f"united: {len(chans)} channels, resolved {len(resolve)}/{len(wanted)}" + (f", not found: {missing}" if missing else ""))
+    out = {}
+    for d in dates():
+        day = dt.datetime.fromisoformat(d).replace(tzinfo=TZ).astimezone(dt.timezone.utc)
+        frm = day.strftime("%Y-%m-%dT%H:%M:%S-00:00")
+        to = (day + dt.timedelta(days=1, seconds=-1)).strftime("%Y-%m-%dT%H:%M:%S-00:00")
+        for w, cid in resolve.items():
+            data = get_json(f"{UC}/v1/public/events/epg?fromTime={frm}&toTime={to}"
+                            f"&communityId={UC_COMMUNITY}&languageId={UC_LANG}&cid={cid}", H, tries=2) or {}
+            for items in data.values() if isinstance(data, dict) else []:
+                for it in items or []:
+                    img = (it.get("images") or [{}])[0].get("path")
+                    out.setdefault(w, []).append({
+                        "start": it.get("startTime"), "stop": it.get("endTime"), "title": it.get("title"),
+                        "desc": it.get("shortDescription"),
+                        "icon": f"https://images-web.ug-be.cdn.united.cloud{img}" if img else None})
+        log(f"united {d}: {len(out)} channels so far")
+    return out
+
+SOURCES = {"mts": source_mts, "united": source_united, "ht": source_ht}
 
 def main():
     cfg = json.load(open("mapping.json"))
