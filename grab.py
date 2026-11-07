@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Grab EPG (mts.rs for Serbia, Hrvatski Telekom for Croatia/SK/CineStar) and write XMLTV
 using the IPTV provider's channel IDs."""
-import datetime as dt, zoneinfo, gzip, hashlib, json, sys, time, uuid, urllib.parse, urllib.request
+import datetime as dt, re, zoneinfo, gzip, hashlib, json, sys, time, uuid, urllib.parse, urllib.request
 from xml.sax.saxutils import escape, quoteattr
 
 DAYS = 3
@@ -143,10 +143,13 @@ def source_united(wanted):
         if w.isdigit():
             resolve[w] = w
             continue
-        for c in chans:
-            if (c.get("name") or "").upper().startswith(w.upper()):
-                resolve[w] = str(c["id"])
-                break
+        norm = lambda n: re.sub(r"\s*(\(.*?\)|HD|SD)\s*", " ", n.upper()).strip()
+        exact = [c for c in chans if norm(c.get("name") or "") == w.upper()]
+        loose = [c for c in chans if (c.get("name") or "").upper().startswith(w.upper())]
+        hit = (exact or loose or [None])[0]
+        if hit:
+            resolve[w] = str(hit["id"])
+            log(f"united: {w} -> {hit['id']} {hit.get('name')}")
     missing = sorted(set(wanted) - set(resolve))
     log(f"united: {len(chans)} channels, resolved {len(resolve)}/{len(wanted)}" + (f", not found: {missing}" if missing else ""))
     out = {}
