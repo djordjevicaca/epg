@@ -8,19 +8,33 @@ TZ = zoneinfo.ZoneInfo("Europe/Belgrade")
 URL = ("https://mts.rs/hybris/ecommerce/b2c/v1/products/search?sort=pozicija-rastuce"
        "&searchQueryContext=CHANNEL_PROGRAM&query=" +
        urllib.parse.quote(":pozicija-rastuce:tip-kanala-radio:TV kanali:channelProgramDates:", safe=":") +
-       "{date}&pageSize=10000")
+       "{date}&pageSize=50&currentPage={page}")
 
-def fetch(date):
-    req = urllib.request.Request(URL.format(date=date), headers={
+def fetch_page(date, page):
+    req = urllib.request.Request(URL.format(date=date, page=page), headers={
         "User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
                 return json.load(r)
         except Exception as e:
-            print(f"{date}: attempt {attempt+1} failed: {e}", file=sys.stderr)
+            print(f"{date} p{page}: attempt {attempt+1} failed: {e}", file=sys.stderr)
             time.sleep(10)
     return None
+
+def fetch(date):
+    products, page = [], 0
+    while page < 40:
+        data = fetch_page(date, page)
+        items = (data or {}).get("products") or []
+        if not items:
+            break
+        products += items
+        total = ((data.get("pagination") or {}).get("totalPages"))
+        page += 1
+        if total is not None and page >= int(total):
+            break
+    return {"products": products} if products else None
 
 def ts(v):
     if v in (None, ""):
@@ -39,6 +53,7 @@ def main():
     for pid, code in mapping.items():
         by_code.setdefault(code, []).append(pid)
 
+    seen = set()
     progs = {}   # code -> {start: prog}
     names = {}
     today = dt.datetime.now(TZ).date()
@@ -49,6 +64,8 @@ def main():
             continue
         for ch in data.get("products", []):
             code = ch.get("code")
+            if d == 0:
+                seen.add(code)
             if code not in by_code:
                 continue
             names[code] = ch.get("name", code)
@@ -81,6 +98,7 @@ def main():
     print(f"channels with data: {len(progs)}/{len(by_code)}, programmes: {total}", file=sys.stderr)
     if missing:
         print("no data for: " + ", ".join(missing), file=sys.stderr)
+    print("mts codes not mapped: " + ", ".join(sorted(c for c in seen if c and c not in by_code)), file=sys.stderr)
     if total == 0:
         sys.exit("no programmes grabbed - keeping previous file")
     xml = "\n".join(out).encode()
