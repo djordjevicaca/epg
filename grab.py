@@ -1,40 +1,27 @@
 #!/usr/bin/env python3
-"""Grab Serbian EPG from mts.rs and write XMLTV with the IPTV provider's channel IDs."""
-import datetime as dt, zoneinfo, gzip, json, sys, time, urllib.parse, urllib.request
+"""Grab EPG (mts.rs for Serbia, Hrvatski Telekom for Croatia/SK/CineStar) and write XMLTV
+using the IPTV provider's channel IDs."""
+import datetime as dt, zoneinfo, gzip, hashlib, json, sys, time, uuid, urllib.parse, urllib.request
 from xml.sax.saxutils import escape, quoteattr
 
 DAYS = 3
 TZ = zoneinfo.ZoneInfo("Europe/Belgrade")
-URL = ("https://mts.rs/hybris/ecommerce/b2c/v1/products/search?sort=pozicija-rastuce"
-       "&searchQueryContext=CHANNEL_PROGRAM&query=" +
-       urllib.parse.quote(":pozicija-rastuce:tip-kanala-radio:TV kanali:channelProgramDates:", safe=":") +
-       "{date}&pageSize=50&currentPage={page}")
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0 Safari/537.36"
 
-def fetch_page(date, page):
-    req = urllib.request.Request(URL.format(date=date, page=page), headers={
-        "User-Agent": "Mozilla/5.0", "Accept": "application/json"})
-    for attempt in range(3):
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+def get_json(url, headers=None, tries=3):
+    for attempt in range(tries):
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            h = {"User-Agent": UA, "Accept": "application/json"}
+            h.update(headers() if callable(headers) else (headers or {}))
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=120) as r:
                 return json.load(r)
         except Exception as e:
-            print(f"{date} p{page}: attempt {attempt+1} failed: {e}", file=sys.stderr)
-            time.sleep(10)
+            log(f"  attempt {attempt+1} failed: {url[:120]}: {e}")
+            time.sleep(5)
     return None
-
-def fetch(date):
-    products, page = [], 0
-    while page < 40:
-        data = fetch_page(date, page)
-        items = (data or {}).get("products") or []
-        if not items:
-            break
-        products += items
-        total = ((data.get("pagination") or {}).get("totalPages"))
-        page += 1
-        if total is not None and page >= int(total):
-            break
-    return {"products": products} if products else None
 
 def ts(v):
     if v in (None, ""):
@@ -47,60 +34,134 @@ def ts(v):
             t = t.replace(tzinfo=TZ)
     return t.strftime("%Y%m%d%H%M%S %z")
 
-def main():
-    mapping = {k: v for k, v in json.load(open("mapping.json")).items() if not k.startswith("_")}
-    by_code = {}
-    for pid, code in mapping.items():
-        by_code.setdefault(code, []).append(pid)
-
-    seen = set()
-    progs = {}   # code -> {start: prog}
-    names = {}
+def dates():
     today = dt.datetime.now(TZ).date()
-    for d in range(-1, DAYS):
-        date = (today + dt.timedelta(days=d)).isoformat()
-        data = fetch(date)
-        if not data:
-            continue
-        for ch in data.get("products", []):
-            code = ch.get("code")
-            if d == 0:
-                seen.add(code)
-            if code not in by_code:
-                continue
-            names[code] = ch.get("name", code)
-            for p in ch.get("programs") or []:
-                s, e = ts(p.get("start")), ts(p.get("end"))
-                if s and e:
-                    progs.setdefault(code, {})[s] = (s, e, p)
-        print(f"{date}: {len(data.get('products', []))} channels", file=sys.stderr)
+    return [(today + dt.timedelta(days=d)).isoformat() for d in range(-1, DAYS)]
 
-    out = ['<?xml version="1.0" encoding="UTF-8"?>', '<tv generator-info-name="aca-epg (mts.rs)">']
-    for code, pids in by_code.items():
-        for pid in pids:
-            out.append(f'<channel id={quoteattr(pid)}><display-name>{escape(names.get(code, pid))}</display-name></channel>')
+# ---------- mts.rs ----------
+MTS_URL = ("https://mts.rs/hybris/ecommerce/b2c/v1/products/search?sort=pozicija-rastuce"
+           "&searchQueryContext=CHANNEL_PROGRAM&query=" +
+           urllib.parse.quote(":pozicija-rastuce:tip-kanala-radio:TV kanali:channelProgramDates:", safe=":") +
+           "{date}&pageSize=50&currentPage={page}")
+
+def source_mts(wanted):
+    out = {}
+    for date in dates():
+        page, n = 0, 0
+        while page < 40:
+            data = get_json(MTS_URL.format(date=date, page=page))
+            items = (data or {}).get("products") or []
+            if not items:
+                break
+            n += len(items)
+            for ch in items:
+                code = ch.get("code")
+                if code not in wanted:
+                    continue
+                for p in ch.get("programs") or []:
+                    out.setdefault(code, []).append({
+                        "start": p.get("start"), "stop": p.get("end"), "title": p.get("title"),
+                        "desc": p.get("description"), "category": p.get("category"),
+                        "icon": (p.get("picture") or {}).get("url")})
+            page += 1
+            tp = (data.get("pagination") or {}).get("totalPages")
+            if tp is not None and page >= int(tp):
+                break
+        log(f"mts {date}: {n} channels")
+    return out
+
+# ---------- Hrvatski Telekom (MojMAXtv) ----------
+HT_API = "https://tv-hr-prod.yo-digital.com/hr-bifrost"
+HT_APP_KEY = "GWaBW4RTloLwpUgYVzOiW5zUxFLmoMj5"
+HT_NATCO_KEY = "l2lyvGVbUm2EKJE96ImQgcc8PKMZWtbE"
+HT_VER = "02.0.1470"
+HT_DEV, HT_SESS = str(uuid.uuid4()), str(uuid.uuid4())
+
+def ht_headers():
+    track, now = str(uuid.uuid4()), str(int(time.time() * 1000))
+    return {
+        "app_key": HT_APP_KEY, "app_version": HT_VER, "device-id": HT_DEV, "tenant": "tv",
+        "origin": "https://mojmaxtv.hrvatskitelekom.hr", "x-call-type": "GUEST_USER",
+        "x-call-time": now, "x-request-session-id": HT_SESS, "x-request-tracking-id": track,
+        "x-tv-step": "EPG_SCHEDULES", "x-tv-flow": "EPG", "x-user-agent": f"web|web|Chrome-149|{HT_VER}|1",
+        "x-txn-id": hashlib.sha256((track + HT_SESS + HT_DEV + now).encode()).hexdigest()[:32]}
+
+def source_ht(wanted):
+    chans = get_json(f"{HT_API}/epg/channel?channelMap_id=&includeVirtualChannels=false"
+                     f"&natco_key={HT_NATCO_KEY}&app_language=hr&natco_code=hr", ht_headers)
+    if not chans:
+        log("ht: channel list failed")
+        return {}
+    by_station = {}
+    for c in chans.get("channels", []):
+        if c.get("title") in wanted:
+            by_station.setdefault(str(c.get("station_id")), c["title"])
+    log(f"ht: {len(chans.get('channels', []))} channels, matched {len(set(by_station.values()))}/{len(wanted)}")
+    missing = sorted(set(wanted) - set(by_station.values()))
+    if missing:
+        log("ht names not found: " + ", ".join(missing))
+    out = {}
+    for date in dates():
+        for off in range(0, 24, 3):
+            data = get_json(f"{HT_API}/epg/channel/schedules?date={date}&hour_offset={off}&hour_range=3"
+                            f"&channelMap_id=&filler=true&app_language=hr&natco_code=hr", ht_headers)
+            for sid, items in ((data or {}).get("channels") or {}).items():
+                name = by_station.get(str(sid))
+                if not name:
+                    continue
+                for it in items or []:
+                    t = it.get("description")
+                    if it.get("episode_name"):
+                        t = f"{t} - {it['episode_name']}"
+                    out.setdefault(name, []).append({
+                        "start": it.get("start_time"), "stop": it.get("end_time"), "title": t,
+                        "category": ", ".join(g.get("name", "") for g in it.get("genres") or []) or None})
+        log(f"ht {date}: {len(out)} channels so far")
+    return out
+
+SOURCES = {"mts": source_mts, "ht": source_ht}
+
+def main():
+    cfg = json.load(open("mapping.json"))
+    chosen = {}  # provider id -> (source, list of progs)
+    names = {}
+    for src, fn in SOURCES.items():
+        mapping = cfg.get(src) or {}
+        try:
+            data = fn(set(mapping.values()))
+        except Exception as e:
+            log(f"{src}: failed: {e}")
+            data = {}
+        for pid, code in mapping.items():
+            names.setdefault(pid, code)
+            if pid not in chosen and data.get(code):
+                chosen[pid] = (src, data[code])
+
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', '<tv generator-info-name="aca-epg">']
+    for pid in sorted(names):
+        out.append(f'<channel id={quoteattr(pid)}><display-name>{escape(names[pid])}</display-name></channel>')
     total = 0
-    for code, items in progs.items():
-        for s, e, p in sorted(items.values()):
+    for pid, (src, progs) in sorted(chosen.items()):
+        seen = {}
+        for p in progs:
+            s, e = ts(p.get("start")), ts(p.get("stop"))
+            if s and e:
+                seen[s] = (s, e, p)
+        for s, e, p in sorted(seen.values()):
             body = f'<title lang="sr">{escape(p.get("title") or "")}</title>'
-            if p.get("description"):
-                body += f'<desc lang="sr">{escape(p["description"])}</desc>'
+            if p.get("desc"):
+                body += f'<desc lang="sr">{escape(p["desc"])}</desc>'
             if p.get("category"):
                 body += f'<category lang="sr">{escape(str(p["category"]))}</category>'
-            img = (p.get("picture") or {}).get("url")
-            if img:
-                body += f'<icon src={quoteattr(img)}/>'
-            for pid in by_code[code]:
-                out.append(f'<programme start="{s}" stop="{e}" channel={quoteattr(pid)}>{body}</programme>')
-                total += 1
+            if p.get("icon"):
+                body += f'<icon src={quoteattr(p["icon"])}/>'
+            out.append(f'<programme start="{s}" stop="{e}" channel={quoteattr(pid)}>{body}</programme>')
+            total += 1
     out.append("</tv>")
-    missing = sorted(set(by_code) - set(progs))
-    print(f"channels with data: {len(progs)}/{len(by_code)}, programmes: {total}", file=sys.stderr)
-    if missing:
-        print("no data for: " + ", ".join(missing), file=sys.stderr)
-    print("mts codes not mapped: " + ", ".join(sorted(c for c in seen if c and c not in by_code)), file=sys.stderr)
+    log(f"provider channels with data: {len(chosen)}/{len(names)}, programmes: {total}")
+    log("no data for: " + ", ".join(sorted(set(names) - set(chosen))))
     if total == 0:
-        sys.exit("no programmes grabbed - keeping previous file")
+        sys.exit("no programmes grabbed")
     xml = "\n".join(out).encode()
     open("public/epg.xml", "wb").write(xml)
     with gzip.open("public/epg.xml.gz", "wb") as f:
