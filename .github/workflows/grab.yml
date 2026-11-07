@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: write
   pages: write
   id-token: write
 jobs:
@@ -15,6 +16,7 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - uses: gautamkrishnar/keepalive-workflow@v2   # sprečava gašenje posle 60 dana
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
